@@ -1,0 +1,9 @@
+openai~=2.14.0
+pandas~=2.3.3
+numpy~=2.3.5
+scikit-learn~=1.8.0
+xgboost~=3.1.2
+python-dotenv~=1.2.1
+scipy~=1.16.3
+httpx~=0.28.1
+tqdm~=4.67.1

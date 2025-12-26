@@ -1,0 +1,1 @@
+Training stopped after 3 iterations. Check logs for best performance.
