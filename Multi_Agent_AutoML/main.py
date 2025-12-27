@@ -10,7 +10,7 @@ engineered_path = os.path.join(config.INTERIM_DATA_DIR, 'engineered_data.csv')
 
 report1_path = os.path.join(config.REPORTS_DIR, 'agent1_summary.txt')
 report2_path = os.path.join(config.REPORTS_DIR, 'agent2_summary.txt')
-report3_path = os.path.join(config.REPORTS_DIR, 'agent3_summary.txt')
+final_summary_path = os.path.join(config.REPORTS_DIR, 'final_summary.md')
 
 generated_code_path = os.path.join(config.REPORTS_DIR, 'generated_code.py')
 
@@ -48,15 +48,15 @@ def main(api_key):
     agent3.run(
         engineered_filepath=engineered_path,
         output_code_filepath=generated_code_path,
-        summary_filepath=report3_path,
+        summary_filepath=final_summary_path,
     )
 
     print("\n=== Pipeline Complete ===")
     print(f"Feature engineered data: {engineered_path}")
     print(f"Final model: {generated_code_path}")
-    print(f"Training report: {report3_path}")
+    print(f"Training report: {final_summary_path}")
 
-    return report3_path
+    return final_summary_path
 
 
 if __name__ == "__main__":

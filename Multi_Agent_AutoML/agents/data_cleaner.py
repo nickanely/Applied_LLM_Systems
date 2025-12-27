@@ -1,7 +1,11 @@
 import pandas as pd
 import json
 from openai import OpenAI
-from Multi_Agent_AutoML.tools.data_tools import (
+from Multi_Agent_AutoML.config import MODEL_NAME
+from Multi_Agent_AutoML.schemas import DataCleanerReport
+from Multi_Agent_AutoML.prompts import get_data_cleaner_prompt, get_data_cleaner_report_prompt
+from Multi_Agent_AutoML.utils import load_csv_data, generate_structured_report
+from Multi_Agent_AutoML.tools import (
     inspect_metadata,
     get_column_stats,
     impute_missing,
@@ -14,50 +18,40 @@ class DataCleanerAgent:
         self.client = OpenAI(api_key=api_key)
         self.conversation_history = []
         self.df = None
-        self.actions_log = []
-
-    def load_data(self, filepath):
-        try:
-            self.df = pd.read_csv(filepath)
-        except FileNotFoundError:
-            print(f"File '{filepath}' not found, please check the path")
-        except Exception:
-            print(f"Unknown error, please check the path")
-        return self.df
-
 
     def execute_tool(self, tool_name, params):
-        if tool_name == "inspect_metadata":
-            result = inspect_metadata(self.df)
+        try:
+            if tool_name == "inspect_metadata":
+                result = inspect_metadata(self.df)
 
-        elif tool_name == "get_column_stats":
-            result = get_column_stats(self.df, params["col"])
+            elif tool_name == "get_column_stats":
+                result = get_column_stats(self.df, params["col"])
 
-        elif tool_name == "impute_missing":
-            self.df = impute_missing(self.df, params["col"], params["strategy"])
-            result = {
-                "status": "success",
-                "action": "impute_missing",
-                "column": params["col"],
-                "strategy": params["strategy"]
-            }
+            elif tool_name == "impute_missing":
+                self.df = impute_missing(self.df, params["col"], params["strategy"])
+                result = {
+                    "status": "success",
+                    "action": "impute_missing",
+                    "column": params["col"],
+                    "strategy": params["strategy"]
+                }
 
-        elif tool_name == "drop_column":
-            self.df = drop_column(self.df, params["col"])
-            result = {
-                "status": "success",
-                "action": "drop_column",
-                "column": params["col"]
-            }
+            elif tool_name == "drop_column":
+                self.df = drop_column(self.df, params["col"])
+                result = {
+                    "status": "success",
+                    "action": "drop_column",
+                    "column": params["col"]
+                }
 
-        else:
-            result = {"error": f"Unknown tool: {tool_name}"}
+            else:
+                result = {"error": f"Unknown tool: {tool_name}"}
 
-        self.actions_log.append({
-            "tool": tool_name,
-            "params": params,
-            "result": result
-        })
+        except Exception as e:
+            error_msg = f"Tool execution failed: {str(e)}"
+            print(f"   !!! Error caught: {error_msg}")
+            return {"status": "error", "message": error_msg}
+
 
         return result
 
@@ -117,67 +111,51 @@ class DataCleanerAgent:
         ]
 
         return self.client.responses.create(
-            model="gpt-5-nano",
+            model=MODEL_NAME,
             input=self.conversation_history,
-            tools=tools,
-            max_output_tokens=3000
+            tools=tools
         )
 
     def run(self, input_filepath, output_filepath, summary_filepath):
-        self.load_data(input_filepath)
+        self.df = load_csv_data(input_filepath)
         self.conversation_history.append({
             "role": "user",
-            "content": f"""
-You are the Data Cleaner Agent – The Auditor.
-
-You must explain every decision in clear, professional language.
-
-Rules:
-- Before calling any tool, explain WHY you are calling it.
-- After receiving a tool result, explain WHAT you learned.
-- Explain WHY you choose to drop or impute any column.
-- Your explanations must be suitable for a technical report.
-- Do NOT hide steps or say “I will now…”. Be explicit and descriptive.
-
-Output format rules:
-- All explanations must be in normal text.
-- Tool calls must be separate (do not embed explanations inside tool calls).
-- When finished, output:
-
-CLEANING_COMPLETE
-<final summary explanation>
-
-Start by inspecting the metadata.
-
-        """
+            "content": get_data_cleaner_prompt()
         })
-
 
         while True:
             response = self.call_llm()
             self.conversation_history.extend(response.output)
-
+            tool_called = False
             for item in response.output:
-                if item.type != "function_call":
-                    continue
+                if item.type == "function_call":
+                    tool_called = True
+                    tool_name = item.name
+                    args = json.loads(item.arguments)
+                    print(f"[Agent calling: {tool_name} with {args}]")
+                    result = self.execute_tool(tool_name, args)
 
-                tool_name = item.name
-                args = json.loads(item.arguments)
-                print(f"[Agent calling: {tool_name} with {args}]")
-                result = self.execute_tool(tool_name, args)
+                    self.conversation_history.append({
+                        "type": "function_call_output",
+                        "call_id": item.call_id,
+                        "output": json.dumps(result, default=str)
+                    })
+            if not tool_called:
+                break
 
-                self.conversation_history.append({
-                    "type": "function_call_output",
-                    "call_id": item.call_id,
-                    "output": json.dumps(result, default=str)
-                })
 
-            final_text = response.output_text or ""
-            if "CLEANING_COMPLETE" in final_text:
-                summary = final_text.replace("CLEANING_COMPLETE", "").strip()
+        report = generate_structured_report(
+            self.client,
+            MODEL_NAME,
+            self.conversation_history,
+            get_data_cleaner_report_prompt(),
+            DataCleanerReport
+        )
+        structured = report.output_parsed
 
-                self.df.to_csv(output_filepath, index=False)
-                with open(summary_filepath, "w") as f:
-                    f.write(summary)
+        self.df.to_csv(output_filepath, index=False)
 
-                return summary
+        with open(summary_filepath, "w") as f:
+            f.write(structured.summary)
+
+        return structured

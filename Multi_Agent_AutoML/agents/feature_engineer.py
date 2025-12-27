@@ -1,12 +1,27 @@
-import pandas as pd
 import json
+
 from openai import OpenAI
 
-from Multi_Agent_AutoML.tools.feature_tools import (
+from Multi_Agent_AutoML.config import (
+    MODEL_NAME,
+)
+from Multi_Agent_AutoML.prompts import (
+    get_feature_engineer_report_prompt,
+    get_feature_engineer_prompt,
+)
+from Multi_Agent_AutoML.schemas import (
+    FeatureEngineerReport,
+)
+from Multi_Agent_AutoML.tools import (
     create_interaction,
     encode_categorical,
     correlation_analysis,
-    select_top_features
+    select_top_features,
+)
+from Multi_Agent_AutoML.utils import (
+    load_csv_data,
+    load_txt_data,
+    generate_structured_report,
 )
 
 
@@ -36,55 +51,40 @@ class FeatureEngineerAgent:
         self.df = None
         self.report_log = []
         self.target_column = None
-        self.agent1_summary = self.load_txt_data(agent1_summary)
-
-    def load_csv_data(self, filepath):
-        try:
-            self.df = pd.read_csv(filepath)
-        except FileNotFoundError:
-            raise FileNotFoundError(f"File '{filepath}' not found")
-        except Exception as e:
-            raise RuntimeError(f"Failed to load data: {e}")
-        return self.df
-
-    def load_txt_data(self, filepath):
-        try:
-            with open(filepath, "r") as f:
-                data = f.read()
-            return data
-        except FileNotFoundError:
-            raise FileNotFoundError(f"File '{filepath}' not found")
-        except Exception as e:
-            raise RuntimeError(f"Failed to load data: {e}")
+        self.agent1_summary = load_txt_data(agent1_summary)
 
     def execute_tool(self, tool_name, params):
-        if tool_name == "select_target_column":
-            self.target_column = params["target_column"]
-            return {"status": "success", "target_column": self.target_column}
+        try:
+            if tool_name == "select_target_column":
+                self.target_column = params["target_column"]
+                return {"status": "success", "target_column": self.target_column}
 
-        elif tool_name == "create_interaction":
-            create_interaction(self.df, params["expression"])  # in-place
-            return {"status": "success", "expression": params["expression"]}
+            elif tool_name == "create_interaction":
+                create_interaction(self.df, params["expression"])  # in-place
+                return {"status": "success", "expression": params["expression"]}
 
-        elif tool_name == "encode_categorical":
-            encode_categorical(self.df, params["col"])  # in-place
-            return {"status": "success", "column": params["col"]}
+            elif tool_name == "encode_categorical":
+                encode_categorical(self.df, params["col"])  # in-place
+                return {"status": "success", "column": params["col"]}
 
-        elif tool_name == "correlation_analysis":
-            if not self.target_column:
-                return {"status": "error", "message": "Target not set"}
-            corr = correlation_analysis(self.df, self.target_column)
-            return {"status": "success", "correlation": corr}
+            elif tool_name == "correlation_analysis":
+                if not self.target_column:
+                    return {"status": "error", "message": "Target not set"}
+                corr = correlation_analysis(self.df, self.target_column)
+                return {"status": "success", "correlation": corr}
 
-        elif tool_name == "select_top_features":
-            if not self.target_column:
-                return {"status": "error", "message": "Target not set"}
-            select_top_features(self.df, params["k"], target=self.target_column)  # in-place
-            return {"status": "success", "k": params["k"]}
+            elif tool_name == "select_top_features":
+                if not self.target_column:
+                    return {"status": "error", "message": "Target not set"}
+                select_top_features(self.df, params["k"], target=self.target_column)  # in-place
+                return {"status": "success", "k": params["k"]}
 
-        else:
-            return {"error": f"Unknown tool: {tool_name}"}
-
+            else:
+                return {"error": f"Unknown tool: {tool_name}"}
+        except Exception as e:
+            error_msg = f"Tool execution failed: {str(e)}"
+            print(f"   !!! Error caught: {error_msg}")
+            return {"status": "error", "message": error_msg}
 
     def call_llm(self):
         tools = [
@@ -143,7 +143,7 @@ class FeatureEngineerAgent:
         ]
 
         response = self.client.responses.create(
-            model="gpt-5",
+            model=MODEL_NAME,
             input=self.conversation_history,
             tools=tools,
         )
@@ -151,91 +151,57 @@ class FeatureEngineerAgent:
         return response
 
     def run(self, clean_filepath, output_filepath, summary_filepath):
-        self.load_csv_data(clean_filepath)
+        self.df = load_csv_data(clean_filepath)
 
         self.conversation_history.append({
             "role": "user",
-            "content": f"""
-You are Agent 2: The Feature Engineer ("The Architect").
-
-You are operating inside a strict execution environment.
-
-IMPORTANT CONTEXT (READ CAREFULLY):
-
-1. You are working with a pandas DataFrame loaded from `clean_data.csv`.
-2. You may ONLY reference columns that currently exist in the DataFrame.
-3. If you encode a categorical column, the original column is REMOVED and replaced by new encoded columns.
-4. You MUST NOT reuse a column name once it has been dropped or encoded.
-5. If a column does not exist, your action will fail and be rejected.
-
-TARGET DISCOVERY:
-- You must identify the most likely target column by reasoning over the dataset and Agent 1's summary.
-- Once identified, treat it as READ-ONLY.
-- NEVER encode, transform, or drop the target column.
-
-AVAILABLE ACTIONS:
-- create_interaction(expression): create numeric features using existing columns only.
-- encode_categorical(col): encode an existing categorical column (this DROPS the original).
-- correlation_analysis(target): analyze feature relevance.
-- select_top_features(k): reduce dimensionality after feature creation.
-
-PROCESS RULES:
-- First, analyze the schema.
-- Second, decide which categorical columns to encode.
-- Third, create interaction features ONLY from existing columns.
-- Fourth, perform feature selection.
-- Do NOT repeat phases.
-
-You must explain every decision in clear technical language suitable for a report.
-
-AGENT 1 SUMMARY:
-{self.agent1_summary}
-
-CURRENT DATAFRAME COLUMNS:
-{list(self.df.columns)}
-
-Start analyzing the dataset.
-
-
-When you have completed feature engineering and feature selection, output:
-
-FEATURE_ENGINEERING_COMPLETE
-<final strategy summary>
-"""
+            "content": get_feature_engineer_prompt(
+                agent1_summary=self.agent1_summary,
+                columns=list(self.df.columns)
+            )
         })
 
         while True:
             response = self.call_llm()
 
             self.conversation_history.extend(response.output)
+            tool_called = False
 
             for item in response.output:
-                if item.type != "function_call":
-                    continue
+                if item.type == "function_call":
+                    tool_called = True
+                    tool_name = item.name
+                    args = json.loads(item.arguments)
+                    print(f"[Agent calling: {tool_name} with {args}]")
 
-                tool_name = item.name
-                args = json.loads(item.arguments)
-                print(f"[Agent calling: {tool_name} with {args}]")
+                    result = self.execute_tool(tool_name, args)
 
-                result = self.execute_tool(tool_name, args)
+                    self.conversation_history.append({
+                        "type": "function_call_output",
+                        "call_id": item.call_id,
+                        "output": json.dumps(result, default=str)
+                    })
 
-                self.conversation_history.append({
-                    "type": "function_call_output",
-                    "call_id": item.call_id,
-                    "output": json.dumps(result, default=str)
-                })
+                    self.conversation_history.append({
+                        "role": "system",
+                        "content": f"CURRENT DATAFRAME COLUMNS: {list(self.df.columns)}"
+                    })
+            if not tool_called:
+                break
 
-                self.conversation_history.append({
-                    "role": "system",
-                    "content": f"CURRENT DATAFRAME COLUMNS: {list(self.df.columns)}"
-                })
+        report = generate_structured_report(
+            client=self.client,
+            model_name=MODEL_NAME,
+            history=self.conversation_history,
+            system_prompt=get_feature_engineer_report_prompt(),
+            response_format=FeatureEngineerReport,
+        )
+        structured = report.output_parsed
 
+        self.df.to_csv(output_filepath, index=False)
 
-            final_text = response.output_text or ""
-            if "FEATURE_ENGINEERING_COMPLETE" in final_text:
-                summary = final_text.replace("FEATURE_ENGINEERING_COMPLETE", "").strip()
-                self.df.to_csv(output_filepath, index=False)
-                with open(summary_filepath, "w") as f:
-                    f.write(summary)
-                print("\n✓ Feature engineering complete. Full report saved.")
-                return summary
+        with open(summary_filepath, "w") as f:
+            f.write(structured.summary)
+
+        print("\nFeature engineering complete. Structured report generated.")
+        return structured

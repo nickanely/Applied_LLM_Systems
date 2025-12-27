@@ -11,7 +11,7 @@ RAW_DATA_DIR = os.path.join(DATA_DIR, 'raw')
 INTERIM_DATA_DIR = os.path.join(DATA_DIR, 'interim')
 REPORTS_DIR = os.path.join(DATA_DIR, 'reports')
 
-MODEL_NAME = "gpt-5"
+MODEL_NAME = "gpt-5-nano"
 
 os.makedirs(RAW_DATA_DIR, exist_ok=True)
 os.makedirs(INTERIM_DATA_DIR, exist_ok=True)

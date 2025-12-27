@@ -1,7 +1,14 @@
-import pandas as pd
 import json
 from openai import OpenAI
-from Multi_Agent_AutoML.tools.model_tools import execute_python_code
+from Multi_Agent_AutoML.utils import load_csv_data, load_txt_data
+from Multi_Agent_AutoML.prompts import (
+    get_model_trainer_prompt,
+    get_context_from_prev_agents,
+    get_report_system_instruction,
+    get_report_user_context,
+)
+from Multi_Agent_AutoML.tools import execute_python_code
+from Multi_Agent_AutoML.config import MODEL_NAME
 
 class ModelTrainerAgent:
     """
@@ -23,38 +30,28 @@ class ModelTrainerAgent:
     def __init__(self, api_key, agent1_summary, agent2_summary):
         self.client = OpenAI(api_key=api_key)
         self.conversation_history = []
-        self.agent1_summary = self.load_txt_data(agent1_summary)
-        self.agent2_summary = self.load_txt_data(agent2_summary)
+        self.agent1_summary = load_txt_data(agent1_summary)
+        self.agent2_summary = load_txt_data(agent2_summary)
         self.iteration_count = 0
         self.max_iterations = 3
         self.best_code = None
-
-    def load_csv_data(self, filepath):
-        try:
-            return pd.read_csv(filepath)
-        except FileNotFoundError:
-            raise FileNotFoundError(f"File '{filepath}' not found")
-        except Exception as e:
-            raise RuntimeError(f"Failed to load data: {e}")
-
-    def load_txt_data(self, filepath):
-        try:
-            with open(filepath, "r") as f:
-                return f.read()
-        except FileNotFoundError:
-            raise FileNotFoundError(f"File '{filepath}' not found")
-        except Exception as e:
-            raise RuntimeError(f"Failed to load data: {e}")
+        self.last_result = None
 
     def execute_tool(self, tool_name, params):
-        if tool_name == "execute_python_code":
-            result = execute_python_code(params["code_string"])
-            self.iteration_count += 1
-            if not result.startswith("ERROR"):
-                self.best_code = params["code_string"]
-            return result
-        else:
-            return {"error": f"Unknown tool: {tool_name}"}
+        try:
+            if tool_name == "execute_python_code":
+                result = execute_python_code(params["code_string"])
+                self.iteration_count += 1
+                if not result.startswith("ERROR"):
+                    self.best_code = params["code_string"]
+                    self.last_result = result
+                return result
+            else:
+                return {"error": f"Unknown tool: {tool_name}"}
+        except Exception as e:
+            error_msg = f"Tool execution failed: {str(e)}"
+            print(f"   !!! Error caught: {error_msg}")
+            return {"status": "error", "message": error_msg}
 
     def call_llm(self):
         tools = [
@@ -76,74 +73,35 @@ class ModelTrainerAgent:
         ]
 
         response = self.client.responses.create(
-            model="gpt-5",
+            model=MODEL_NAME,
             input=self.conversation_history,
             tools=tools,
         )
 
         return response
 
+    # ---------------------------
+    # Training loop
+    # ---------------------------
+
     def run(self, engineered_filepath, output_code_filepath, summary_filepath):
-        df = self.load_csv_data(engineered_filepath)
-        summary = ""
+        df = load_csv_data(engineered_filepath)
         self.conversation_history.append({
             "role": "system",
-            "content": f"""You are Agent 3: The Model Trainer ("The Coder").
-
-Your goal: Train an XGBoost model on the engineered dataset and iteratively improve it.
-
-WORKFLOW:
-1. Generate Python code to train XGBoost model
-2. Execute the code using execute_python_code tool
-3. Analyze the returned metrics
-4. Decide: Are metrics satisfactory?
-   - YES: Output "TERMINATE" and explain final results
-   - NO: Generate improved code with different hyperparameters and repeat
-
-CODE REQUIREMENTS:
-- Load data from: {engineered_filepath}
-- Use train_test_split with test_size=0.2, random_state=42
-- Determine task type automatically (classification if unique values < 20, else regression)
-- For classification: XGBClassifier, print Accuracy, Precision, Recall, F1
-- For regression: XGBRegressor, print MSE, RMSE, R2
-- Print ONLY the metrics in a clear format
-
-HYPERPARAMETERS TO TUNE:
-- learning_rate (0.01 to 0.3)
-- max_depth (3 to 10)
-- n_estimators (50 to 500)
-- subsample (0.5 to 1.0)
-- colsample_bytree (0.5 to 1.0)
-
-SUCCESS CRITERIA:
-- Classification: Accuracy > 0.90
-(recall, precision, F1 accordingly - you decide if tuning is necessary based on those values)
-- Regression: R2 > 0.85
-
-Maximum iterations: {self.max_iterations}"""
+            "content": get_model_trainer_prompt(
+                engineered_filepath=engineered_filepath,
+                max_iterations=self.max_iterations,
+            )
         })
 
         self.conversation_history.append({
             "role": "user",
-            "content": f"""CONTEXT FROM PREVIOUS AGENTS:
-
-=== AGENT 1: DATA CLEANING ===
-{self.agent1_summary}
-
-=== AGENT 2: FEATURE ENGINEERING ===
-{self.agent2_summary}
-
-=== CURRENT DATASET ===
-Filepath: {engineered_filepath}
-Shape: {df.shape}
-Columns: {list(df.columns)}
-Dtypes:
-{df.dtypes.to_string()}
-
-First few rows:
-{df.head().to_string()}
-
-Begin by generating and executing baseline training code."""
+            "content": get_context_from_prev_agents(
+                agent1_summary=self.agent1_summary,
+                agent2_summary=self.agent2_summary,
+                engineered_filepath=engineered_filepath,
+                df=df,
+            )
         })
 
         while self.iteration_count < self.max_iterations:
@@ -152,70 +110,60 @@ Begin by generating and executing baseline training code."""
             response = self.call_llm()
 
             self.conversation_history.extend(response.output)
+            tool_called = False
 
-            # if msg.tool_calls:
             for item in response.output:
-                if item.type != "function_call":
-                    continue
-                tool_name = item.name
-                args = json.loads(item.arguments)
+                if item.type == "function_call":
+                    tool_called = True
 
-                print(f"[Agent calling: {tool_name}]")
-                result = self.execute_tool(tool_name, args)
-                print(f"Execution output:\n{result}")
+                    tool_name = item.name
+                    args = json.loads(item.arguments)
 
-                self.conversation_history.append({
-                    "type": "function_call_output",
-                    "call_id": item.call_id,
-                    "output": json.dumps(result, default=str)
-                })
+                    print(f"[Agent calling: {tool_name}]")
+                    result = self.execute_tool(tool_name, args)
 
-                # Decision point
-                decision_response = self.client.responses.create(
-                    model="gpt-5",
-                    input=self.conversation_history + [{
-                        "role": "user",
-                        "content": "Analyze these metrics. Are they satisfactory? If yes, say 'TERMINATE' and summarize. If no, explain what to improve and call execute_python_code again with better hyperparameters."
-                    }]
-                )
+                    self.conversation_history.append({
+                        "type": "function_call_output",
+                        "call_id": item.call_id,
+                        "output": json.dumps(result, default=str)
+                    })
 
-                decision_msg = decision_response.output_text
-                self.conversation_history.append({
-                    "role": "assistant",
-                    "content": f"[Decision Message]: {decision_msg}"
-                })
+            if not tool_called:
+                break
 
-
-                if "TERMINATE" in decision_msg:
-                    summary = f"""MODEL TRAINING COMPLETE
-
-                                Iterations: {self.iteration_count}
-                                
-                                Final Analysis:
-                                {decision_msg}
-                                
-                                Last Execution Output:
-                                {result}"""
-
-                    if self.best_code:
-                        with open(output_code_filepath, "w") as f:
-                            f.write(self.best_code)
-
-                    with open(summary_filepath, "w") as f:
-                        f.write(summary)
-
-                    print("\n✓ Model training complete. Report saved.")
-                    return summary
-
-
-        summary += f"Training stopped after {self.max_iterations} iterations. Check logs for best performance."
 
         if self.best_code:
             with open(output_code_filepath, "w") as f:
                 f.write(self.best_code)
 
-        with open(summary_filepath, "w") as f:
-            f.write(summary)
+        # ---------------------------
+        # Final LLM-generated report
+        # ---------------------------
+        report_response = self.client.responses.create(
+            model=MODEL_NAME,
+            input=[
+                {
+                    "role": "system",
+                    "content": get_report_system_instruction()
+                },
+                {
+                    "role": "user",
+                    "content": get_report_user_context(
+                        filepath=engineered_filepath,
+                        df = df,
+                        agent1_summary=self.agent1_summary,
+                        agent2_summary=self.agent2_summary,
+                        iterations=self.iteration_count,
+                        last_result=self.last_result,
+                        code_path=output_code_filepath if self.best_code else "None",
+                    )
+                }
+            ]
+)
 
-        print(f"\n⚠ Reached maximum iterations.")
-        return summary
+        final_report_md = report_response.output_text or ""
+
+        with open(summary_filepath, "w") as f:
+            f.write(final_report_md.strip())
+
+        return final_report_md.strip()
